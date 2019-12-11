@@ -148,8 +148,9 @@ class Platform(object):
         'i686': 'x86',
         'x64': 'x86_64',
     }
+    SIMULATED = ['arm', 'arm64']
 
-    def __init__(self, system=None, machine=None):
+    def __init__(self, system=None, machine=None, simulates=None):
         if system is None:
             system = std_platform.system()
         if machine is None:
@@ -162,6 +163,9 @@ class Platform(object):
         self.system = system
         self.machine = fixed_machine
         self.gecko_platform = self.SUPPORTED[system][fixed_machine]
+        if simulates is not None:
+            self.gecko_platform = '%s-sim-%s' % (simulates, self.gecko_platform)
+
 
     @classmethod
     def from_platform_guess(cls, build_string):
@@ -199,7 +203,7 @@ class BuildTask(object):
     RE_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
     RE_REV = re.compile(r'^([0-9A-F]{12}|[0-9A-F]{40})$', re.IGNORECASE)
 
-    def __init__(self, build, branch, flags, platform=None, _blank=False):
+    def __init__(self, build, branch, flags, target, platform=None, _blank=False):
         """
         Retrieve the task JSON object
         Requires first generating the task URL based on the specified build type and platform
@@ -209,7 +213,7 @@ class BuildTask(object):
             self.queue_server = None
             self._data = {}
             return
-        for obj in self.iterall(build, branch, flags, platform=platform):
+        for obj in self.iterall(build, branch, flags, target, platform=platform):
             self.url = obj.url
             self.queue_server = obj.queue_server
             self._data = obj._data  # pylint: disable=protected-access
@@ -226,7 +230,7 @@ class BuildTask(object):
         return build
 
     @classmethod
-    def iterall(cls, build, branch, flags, platform=None):
+    def iterall(cls, build, branch, flags, target, platform=None):
         """Generator for all possible BuildTasks with these parameters"""
         # Prepare build type
         if platform is None:
@@ -238,7 +242,8 @@ class BuildTask(object):
             flag_str = flags.build_string()
             task_template_paths = tuple(
                 (template, path + flag_str)
-                for (template, path) in cls._pushdate_template_paths(build.replace('-', '.'), branch, target_platform)
+                for (template, path) in
+                cls._pushdate_template_paths(build.replace('-', '.'), branch, target, target_platform)
             )
 
         elif cls.RE_REV.match(build):
@@ -255,8 +260,10 @@ class BuildTask(object):
             else:
                 namespace = 'gecko.v2.mozilla-' + branch + '.latest'
             product = 'mobile' if 'android' in target_platform else 'firefox'
-            task_path = '/task/%s.%s.%s%s' % (namespace, product, target_platform, flags.build_string())
-            task_template_paths = ((cls.TASKCLUSTER_APIS[0], task_path),)
+            task_paths = ['/task/%s.%s.%s%s' % (namespace, product, target_platform, flags.build_string())]
+            if target == 'js':
+                task_paths.append('/task/%s.%s.sm-%s%s' % (namespace, product, target_platform, flags.build_string()))
+            task_template_paths = tuple((cls.TASKCLUSTER_APIS[0], path) for path in task_paths)
 
         else:
             # try to use build argument directly as a namespace
@@ -283,7 +290,7 @@ class BuildTask(object):
             except requests.exceptions.RequestException:
                 continue
 
-            obj = cls(None, None, None, _blank=True)
+            obj = cls(None, None, None, None, _blank=True)
             obj.url = url
             obj.queue_server = template % ('queue',)
             obj._data = data.json()  # pylint: disable=protected-access
@@ -297,7 +304,7 @@ class BuildTask(object):
         raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
 
     @classmethod
-    def _pushdate_template_paths(cls, pushdate, branch, target_platform):
+    def _pushdate_template_paths(cls, pushdate, branch, target, target_platform):
         """Multiple entries exist per push date. Iterate over all until a working entry is found"""
         if branch != 'try':
             branch = 'mozilla-' + branch
@@ -320,18 +327,23 @@ class BuildTask(object):
             json = base.json()
             for namespace in sorted(json['namespaces'], key=lambda x: x['name']):
                 yield (template, '/task/' + namespace['namespace'] + '.' + product + '.' + target_platform)
+                if target == 'js':
+                    yield (template, '/task/' + namespace['namespace'] + '.' + product + '.sm-' + target_platform)
 
         if not date_found:
             raise FetcherException(last_exc)
 
     @classmethod
-    def _revision_paths(cls, rev, branch, target_platform):
+    def _revision_paths(cls, rev, branch, target, target_platform):
         """Retrieve the API path for revision based builds"""
         if branch != 'try':
             branch = 'mozilla-' + branch
         namespace = 'gecko.v2.' + branch + '.revision.' + rev
         product = 'mobile' if 'android' in target_platform else 'firefox'
         yield '/task/' + namespace + '.' + product + '.' + target_platform
+
+        if target == 'js':
+            yield '/task/' + namespace + '.' + product + '.sm-' + target_platform
 
 
 class Fetcher(object):
@@ -340,7 +352,7 @@ class Fetcher(object):
     TEST_CHOICES = {'common', 'reftests', 'gtest'}
     BUILD_ORDER_ASC = 1
     BUILD_ORDER_DESC = 2
-    re_target = re.compile(r'(\.linux-(x86_64|i686)(-asan)?|target|mac(64)?|win(32|64))\.json$')
+    re_target = re.compile(r'(\.linux-(x86_64|i686)(-asan)?|target|mac(64)?|win(32|64)|js)\.json$')
 
     def __init__(self, target, branch, build, flags, platform=None, nearest=None):
         """
@@ -423,7 +435,7 @@ class Fetcher(object):
             now = datetime.now(timezone('UTC'))
 
             try:
-                self._task = BuildTask(build, branch, self._flags, self._platform)
+                self._task = BuildTask(build, branch, self._flags, target, self._platform)
             except FetcherException:
                 if not nearest:
                     raise
@@ -458,7 +470,8 @@ class Fetcher(object):
 
                 while start < end if asc else start > end:
                     try:
-                        self._task = BuildTask(start.strftime('%Y-%m-%d'), branch, self._flags, self._platform)
+                        build = start.strftime('%Y-%m-%d')
+                        self._task = BuildTask(build, branch, self._flags, target, self._platform)
                         break
                     except FetcherException:
                         LOG.warning('Unable to find build for %s', start.strftime('%Y-%m-%d'))
@@ -830,13 +843,15 @@ class Fetcher(object):
 
         target_group = parser.add_argument_group('Target')
         target_group.add_argument('--target', choices=sorted(cls.TARGET_CHOICES),
-                                  help=('Specify the build target. (default: %(default)s)'))
+                                  help='Specify the build target. (default: %(default)s)')
         target_group.add_argument('--os', choices=sorted(Platform.SUPPORTED),
                                   help=('Specify the target system. (default: ' + std_platform.system() + ')'))
         cpu_choices = sorted(set(itertools.chain(itertools.chain.from_iterable(Platform.SUPPORTED.values()),
                                                  Platform.CPU_ALIASES)))
         target_group.add_argument('--cpu', choices=cpu_choices,
                                   help=('Specify the target CPU. (default: ' + std_platform.machine() + ')'))
+        target_group.add_argument('--sim', choices=Platform.SIMULATED,
+                                  help='Specify the simulated architecture.')
 
         type_group = parser.add_argument_group('Build')
         type_group.add_argument('--build', metavar='DATE|REV|NS',
@@ -899,7 +914,7 @@ class Fetcher(object):
 
         args = parser.parse_args(args=args)
 
-        if re.match(r'(\d{4}-\d{2}-\d{2}|[0-9A-Fa-f]{12}|[0-9A-Fa-f]{40}|latest)$', args.build) is None:
+        if re.match(r'(\d{4}-\d{2}-\d{2}|[0-9A-Fa-f]{12}|[0-9A-Fa-f]{40}|latest)', args.build) is None:
             # this is a custom build
             # ensure conflicting options are not set
             if args.branch is not None:
@@ -920,11 +935,14 @@ class Fetcher(object):
         elif args.branch is None:
             args.branch = 'central'
 
-        if args.branch.startswith('esr'):
+        if args.branch and args.branch.startswith('esr'):
             args.branch = Fetcher.resolve_esr(args.branch)
 
+        if args.sim is not None and args.target != 'js':
+            parser.error('Simulated builds are only available for JS')
+
         flags = BuildFlags(args.asan, args.debug, args.fuzzing, args.coverage, args.valgrind)
-        obj = cls(args.target, args.branch, args.build, flags, Platform(args.os, args.cpu), args.nearest)
+        obj = cls(args.target, args.branch, args.build, flags, Platform(args.os, args.cpu, args.sim), args.nearest)
 
         if args.name is None:
             args.name = obj.get_auto_name()
